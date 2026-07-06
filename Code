@@ -1,0 +1,826 @@
+"""
+AI Mouse to Cheese Maze - 30x30
+- Each cell represents 16 x 16 cm.
+- Start and finish are real openings on the outer maze boundary.
+- At least 6 maze candidates are generated and evaluated before one is selected.
+- The mouse can decide only: FRONT, LEFT, RIGHT, BACK.
+- Cheese smell is Euclidean displacement (straight-line distance), not maze-path distance.
+- The mouse dies when simulated time exceeds 3 minutes.
+- Final success/death time is printed in minutes.
+
+Run:
+    python ai_mouse_cheese_maze_30x30.py
+
+Headless test:
+    python ai_mouse_cheese_maze_30x30.py --headless
+
+Real-time animation:
+    python ai_mouse_cheese_maze_30x30.py --realtime
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import random
+import time
+import tkinter as tk
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+
+# =========================
+# GAME CONFIGURATION
+# =========================
+ROWS = 30
+COLS = 30
+CELL_SIZE_CM = 16
+CELL_PIXELS = 20
+
+START = (0, 0)
+FINISH = (ROWS - 1, COLS - 1)
+
+# Physical/simulated movement time:
+# 16 cm per 0.50 s = approximately 0.213 m/s.
+MOVE_TIME_SEC = 0.50
+DEATH_TIME_SEC = 3 * 60
+
+# Fast visual playback. The simulation clock still advances by MOVE_TIME_SEC.
+ANIMATION_DELAY_MS = 55
+
+# The user requested more than 5 computation rounds.
+MIN_COMPUTE_RUNS = 6
+MAX_GENERATION_ATTEMPTS = 500
+
+# Fixed seed makes the rebuilt maze repeatable.
+BASE_SEED = 20260706
+
+
+# Wall bit masks and absolute directions.
+NORTH = 1
+EAST = 2
+SOUTH = 4
+WEST = 8
+ALL_WALLS = NORTH | EAST | SOUTH | WEST
+
+DIRECTIONS = (NORTH, EAST, SOUTH, WEST)
+DIRECTION_NAME = {
+    NORTH: "NORTH",
+    EAST: "EAST",
+    SOUTH: "SOUTH",
+    WEST: "WEST",
+}
+DR = {NORTH: -1, EAST: 0, SOUTH: 1, WEST: 0}
+DC = {NORTH: 0, EAST: 1, SOUTH: 0, WEST: -1}
+OPPOSITE = {NORTH: SOUTH, SOUTH: NORTH, EAST: WEST, WEST: EAST}
+LEFT_OF = {NORTH: WEST, WEST: SOUTH, SOUTH: EAST, EAST: NORTH}
+RIGHT_OF = {NORTH: EAST, EAST: SOUTH, SOUTH: WEST, WEST: NORTH}
+
+
+Cell = Tuple[int, int]
+Walls = List[List[int]]
+
+
+@dataclass
+class Decision:
+    position: Cell
+    facing: int
+    relative_move: str
+    absolute_direction: int
+    smell_cells: float
+
+
+@dataclass
+class Candidate:
+    walls: Walls
+    decisions: List[Decision]
+    path: List[Cell]
+    generation_seconds: float
+    solve_seconds: float
+    seed: int
+
+    @property
+    def moves(self) -> int:
+        return max(0, len(self.path) - 1)
+
+    @property
+    def simulated_seconds(self) -> float:
+        return self.moves * MOVE_TIME_SEC
+
+    @property
+    def survives(self) -> bool:
+        return self.simulated_seconds <= DEATH_TIME_SEC
+
+
+def inside(row: int, col: int) -> bool:
+    return 0 <= row < ROWS and 0 <= col < COLS
+
+
+def cheese_displacement(cell: Cell) -> float:
+    """Straight-line displacement to the cheese, measured in cells."""
+    row, col = cell
+    return math.hypot(FINISH[0] - row, FINISH[1] - col)
+
+
+def generate_perfect_maze(seed: int) -> Walls:
+    """
+    Generate a perfect maze with iterative randomized depth-first search.
+    A perfect maze has exactly one maze path between any two cells.
+    """
+    rng = random.Random(seed)
+    walls: Walls = [[ALL_WALLS for _ in range(COLS)] for _ in range(ROWS)]
+
+    stack: List[Cell] = [START]
+    visited: Set[Cell] = {START}
+
+    while stack:
+        row, col = stack[-1]
+        choices: List[Tuple[int, int, int]] = []
+
+        for direction in DIRECTIONS:
+            next_row = row + DR[direction]
+            next_col = col + DC[direction]
+            if inside(next_row, next_col) and (next_row, next_col) not in visited:
+                choices.append((direction, next_row, next_col))
+
+        if not choices:
+            stack.pop()
+            continue
+
+        direction, next_row, next_col = rng.choice(choices)
+
+        # Remove the wall between the current and next cell.
+        walls[row][col] &= ~direction
+        walls[next_row][next_col] &= ~OPPOSITE[direction]
+
+        visited.add((next_row, next_col))
+        stack.append((next_row, next_col))
+
+    # Real entrance and exit openings on the maze boundary.
+    walls[START[0]][START[1]] &= ~WEST
+    walls[FINISH[0]][FINISH[1]] &= ~EAST
+
+    return walls
+
+
+def direction_between(source: Cell, destination: Cell) -> int:
+    row_delta = destination[0] - source[0]
+    col_delta = destination[1] - source[1]
+
+    if row_delta == -1 and col_delta == 0:
+        return NORTH
+    if row_delta == 1 and col_delta == 0:
+        return SOUTH
+    if row_delta == 0 and col_delta == 1:
+        return EAST
+    if row_delta == 0 and col_delta == -1:
+        return WEST
+
+    raise ValueError(f"Cells are not adjacent: {source} -> {destination}")
+
+
+def relative_name(facing: int, move_direction: int) -> str:
+    if move_direction == facing:
+        return "FRONT"
+    if move_direction == LEFT_OF[facing]:
+        return "LEFT"
+    if move_direction == RIGHT_OF[facing]:
+        return "RIGHT"
+    return "BACK"
+
+
+def simulate_mouse_ai(walls: Walls) -> Tuple[List[Cell], List[Decision]]:
+    """
+    Smell-guided DFS/backtracking policy.
+
+    The mouse:
+    1. Looks only at passages immediately around its current cell.
+    2. Expresses each move relative to its current facing direction:
+       FRONT, LEFT, RIGHT, BACK.
+    3. Prefers an unvisited neighbor with the smallest Euclidean displacement
+       to the cheese.
+    4. If all available neighbors have been visited, it goes BACK to its parent.
+
+    It never receives the shortest maze route.
+    """
+    current = START
+    facing = EAST
+
+    visited: Set[Cell] = {START}
+    parent: Dict[Cell, Cell] = {}
+    path: List[Cell] = [START]
+    decisions: List[Decision] = []
+
+    while current != FINISH:
+        row, col = current
+
+        # Relative options allowed by the game.
+        relative_order: Sequence[Tuple[str, int]] = (
+            ("FRONT", facing),
+            ("LEFT", LEFT_OF[facing]),
+            ("RIGHT", RIGHT_OF[facing]),
+            ("BACK", OPPOSITE[facing]),
+        )
+
+        unvisited_options: List[Tuple[float, int, str, int, Cell]] = []
+
+        for tie_rank, (move_name, direction) in enumerate(relative_order):
+            if walls[row][col] & direction:
+                continue
+
+            next_cell = (row + DR[direction], col + DC[direction])
+            if not inside(*next_cell):
+                # Ignore the outside entrance/exit while solving.
+                continue
+
+            if next_cell not in visited:
+                distance = cheese_displacement(next_cell)
+                unvisited_options.append(
+                    (distance, tie_rank, move_name, direction, next_cell)
+                )
+
+        if unvisited_options:
+            # Smell rule: choose the smallest straight-line displacement.
+            distance, _, move_name, direction, next_cell = min(unvisited_options)
+            parent[next_cell] = current
+            visited.add(next_cell)
+        else:
+            # Dead end: the only intelligent recovery is to backtrack.
+            if current == START:
+                raise RuntimeError("AI could not find a route from the start.")
+
+            next_cell = parent[current]
+            direction = direction_between(current, next_cell)
+            move_name = relative_name(facing, direction)
+            distance = cheese_displacement(next_cell)
+
+        decisions.append(
+            Decision(
+                position=current,
+                facing=facing,
+                relative_move=move_name,
+                absolute_direction=direction,
+                smell_cells=distance,
+            )
+        )
+
+        current = next_cell
+        facing = direction
+        path.append(current)
+
+        # Safety guard; a 30x30 perfect maze should finish well below this.
+        if len(path) > ROWS * COLS * 4:
+            raise RuntimeError("AI exceeded the safety move limit.")
+
+    return path, decisions
+
+
+def build_game(seed_offset: int = 0) -> Tuple[Candidate, int, float]:
+    """
+    Generate/evaluate at least MIN_COMPUTE_RUNS candidates.
+    Continue generating if needed until at least one candidate survives.
+    Select the surviving candidate with the fewest AI moves.
+    """
+    total_start = time.perf_counter()
+    candidates: List[Candidate] = []
+    surviving: List[Candidate] = []
+
+    for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+        seed = BASE_SEED + seed_offset + attempt
+
+        generation_start = time.perf_counter()
+        walls = generate_perfect_maze(seed)
+        generation_seconds = time.perf_counter() - generation_start
+
+        solve_start = time.perf_counter()
+        path, decisions = simulate_mouse_ai(walls)
+        solve_seconds = time.perf_counter() - solve_start
+
+        candidate = Candidate(
+            walls=walls,
+            decisions=decisions,
+            path=path,
+            generation_seconds=generation_seconds,
+            solve_seconds=solve_seconds,
+            seed=seed,
+        )
+        candidates.append(candidate)
+
+        if candidate.survives:
+            surviving.append(candidate)
+
+        print(
+            f"Compute #{attempt:02d} | seed={seed} | "
+            f"generation={generation_seconds * 1000:.3f} ms | "
+            f"AI={solve_seconds * 1000:.3f} ms | "
+            f"moves={candidate.moves} | "
+            f"simulated={candidate.simulated_seconds / 60:.3f} min | "
+            f"{'SURVIVES' if candidate.survives else 'DIES'}"
+        )
+
+        # Always compute more than 5 times, then stop once a valid field exists.
+        if attempt >= MIN_COMPUTE_RUNS and surviving:
+            break
+
+    if not surviving:
+        raise RuntimeError(
+            f"No maze survived after {MAX_GENERATION_ATTEMPTS} attempts. "
+            "Try reducing MOVE_TIME_SEC."
+        )
+
+    selected = min(surviving, key=lambda item: item.moves)
+    total_seconds = time.perf_counter() - total_start
+
+    print("-" * 76)
+    print(
+        f"Selected maze seed={selected.seed}, moves={selected.moves}, "
+        f"predicted success={selected.simulated_seconds / 60:.3f} minute(s), "
+        f"compute cycles={len(candidates)}, "
+        f"total computing time={total_seconds * 1000:.3f} ms"
+    )
+    print("-" * 76)
+
+    return selected, len(candidates), total_seconds
+
+
+class MazeGame:
+    def __init__(self, root: tk.Tk, realtime: bool = False) -> None:
+        self.root = root
+        self.root.title("AI Mouse to Cheese Maze 30x30")
+        self.root.resizable(False, False)
+
+        self.realtime = realtime
+        self.delay_ms = int(MOVE_TIME_SEC * 1000) if realtime else ANIMATION_DELAY_MS
+
+        self.seed_offset = 0
+        self.candidate: Optional[Candidate] = None
+        self.compute_cycles = 0
+        self.total_compute_seconds = 0.0
+
+        self.step_index = 0
+        self.elapsed_seconds = 0.0
+        self.running = False
+        self.finished = False
+        self.after_id: Optional[str] = None
+        self.trail_items: List[int] = []
+
+        board_width = COLS * CELL_PIXELS
+        board_height = ROWS * CELL_PIXELS
+
+        container = tk.Frame(root, padx=10, pady=10)
+        container.pack()
+
+        self.canvas = tk.Canvas(
+            container,
+            width=board_width,
+            height=board_height,
+            bg="white",
+            highlightthickness=1,
+            highlightbackground="black",
+        )
+        self.canvas.grid(row=0, column=0, rowspan=20, padx=(0, 12))
+
+        side = tk.Frame(container, width=290)
+        side.grid(row=0, column=1, sticky="n")
+
+        tk.Label(
+            side,
+            text="AI MOUSE → CHEESE",
+            font=("Arial", 16, "bold"),
+        ).pack(pady=(0, 8))
+
+        info = (
+            "Maze: 30 × 30 cells\n"
+            "Cell: 16 × 16 cm\n"
+            "Field: 4.8 × 4.8 m\n"
+            "Death limit: 3.00 minutes\n"
+            f"Move time: {MOVE_TIME_SEC:.2f} s/cell"
+        )
+        tk.Label(side, text=info, justify="left", font=("Arial", 10)).pack(anchor="w")
+
+        tk.Label(
+            side,
+            text="\nMouse decisions:\nFRONT / LEFT / RIGHT / BACK",
+            justify="left",
+            font=("Arial", 10, "bold"),
+        ).pack(anchor="w")
+
+        self.status_var = tk.StringVar(value="Preparing maze...")
+        self.time_var = tk.StringVar(value="Time: 0.000 min")
+        self.move_var = tk.StringVar(value="Move: 0")
+        self.smell_var = tk.StringVar(value="Smell displacement: -")
+        self.decision_var = tk.StringVar(value="Decision: -")
+        self.compute_var = tk.StringVar(value="Compute cycles: -")
+        self.result_var = tk.StringVar(value="")
+
+        labels = (
+            self.status_var,
+            self.time_var,
+            self.move_var,
+            self.smell_var,
+            self.decision_var,
+            self.compute_var,
+        )
+        for variable in labels:
+            tk.Label(side, textvariable=variable, anchor="w", justify="left").pack(
+                fill="x", pady=2
+            )
+
+        tk.Label(
+            side,
+            textvariable=self.result_var,
+            wraplength=275,
+            justify="left",
+            font=("Arial", 12, "bold"),
+        ).pack(fill="x", pady=(12, 8))
+
+        button_row = tk.Frame(side)
+        button_row.pack(fill="x", pady=6)
+
+        self.start_button = tk.Button(
+            button_row, text="Start / Pause", command=self.toggle_running, width=14
+        )
+        self.start_button.grid(row=0, column=0, padx=(0, 5))
+
+        tk.Button(
+            button_row, text="New Maze", command=self.new_maze, width=12
+        ).grid(row=0, column=1)
+
+        tk.Button(side, text="Restart Same Maze", command=self.restart).pack(
+            fill="x", pady=3
+        )
+
+        mode_text = (
+            "Animation: REAL TIME"
+            if realtime
+            else "Animation: FAST (simulation time remains physical)"
+        )
+        tk.Label(
+            side,
+            text=mode_text,
+            wraplength=275,
+            justify="left",
+            fg="#333333",
+        ).pack(anchor="w", pady=(8, 0))
+
+        tk.Label(
+            side,
+            text=(
+                "\nKeyboard:\n"
+                "Space = Start/Pause\n"
+                "R = Restart\n"
+                "N = New Maze"
+            ),
+            justify="left",
+        ).pack(anchor="w")
+
+        root.bind("<space>", lambda _event: self.toggle_running())
+        root.bind("<r>", lambda _event: self.restart())
+        root.bind("<R>", lambda _event: self.restart())
+        root.bind("<n>", lambda _event: self.new_maze())
+        root.bind("<N>", lambda _event: self.new_maze())
+
+        self.mouse_item: Optional[int] = None
+        self.mouse_nose_item: Optional[int] = None
+
+        self.prepare_maze()
+
+    def cancel_animation(self) -> None:
+        if self.after_id is not None:
+            self.root.after_cancel(self.after_id)
+            self.after_id = None
+
+    def prepare_maze(self) -> None:
+        self.cancel_animation()
+        self.running = False
+        self.finished = False
+        self.status_var.set("Computing at least 6 maze candidates...")
+        self.root.update_idletasks()
+
+        self.candidate, self.compute_cycles, self.total_compute_seconds = build_game(
+            self.seed_offset
+        )
+        self.compute_var.set(
+            f"Compute cycles: {self.compute_cycles}\n"
+            f"Compute time: {self.total_compute_seconds * 1000:.3f} ms\n"
+            f"Selected seed: {self.candidate.seed}"
+        )
+        self.draw_maze()
+        self.reset_state()
+        self.status_var.set("Ready")
+
+    def new_maze(self) -> None:
+        self.seed_offset += 10_000
+        self.prepare_maze()
+
+
+    def restart(self) -> None:
+        self.cancel_animation()
+        self.running = False
+        self.finished = False
+        self.draw_maze()
+        self.reset_state()
+        self.status_var.set("Ready")
+  
+
+    def reset_state(self) -> None:
+        self.step_index = 0
+        self.elapsed_seconds = 0.0
+        self.finished = False
+        self.result_var.set("")
+        self.time_var.set("Time: 0.000 min")
+        self.move_var.set("Move: 0")
+        self.smell_var.set(
+            f"Smell displacement: {cheese_displacement(START):.2f} cells"
+        )
+        self.decision_var.set("Decision: -")
+        self.place_mouse(START, EAST)
+
+    def toggle_running(self) -> None:
+        if self.finished:
+            return
+
+        self.running = not self.running
+        self.status_var.set("RUNNING" if self.running else "PAUSED")
+
+        if self.running:
+            self.animate_one_step()
+
+    def animate_one_step(self) -> None:
+        if not self.running or self.finished or self.candidate is None:
+            return
+
+        if self.elapsed_seconds > DEATH_TIME_SEC:
+            self.finish_game(success=False)
+            return
+
+        if self.step_index >= len(self.candidate.decisions):
+            self.finish_game(success=True)
+            return
+
+        decision = self.candidate.decisions[self.step_index]
+        next_cell = self.candidate.path[self.step_index + 1]
+
+        self.decision_var.set(
+            f"Decision: {decision.relative_move}\n"
+            f"Facing: {DIRECTION_NAME[decision.facing]}"
+        )
+
+        self.draw_trail(self.candidate.path[self.step_index])
+        self.place_mouse(next_cell, decision.absolute_direction)
+
+        self.step_index += 1
+        self.elapsed_seconds += MOVE_TIME_SEC
+
+        displacement_cells = cheese_displacement(next_cell)
+        displacement_meters = displacement_cells * CELL_SIZE_CM / 100.0
+
+        self.time_var.set(
+            f"Time: {self.elapsed_seconds / 60:.3f} min "
+            f"({self.elapsed_seconds:.2f} s)"
+        )
+        self.move_var.set(f"Move: {self.step_index}")
+        self.smell_var.set(
+            f"Smell displacement: {displacement_cells:.2f} cells\n"
+            f"Straight-line distance: {displacement_meters:.2f} m"
+        )
+
+        if self.elapsed_seconds > DEATH_TIME_SEC:
+            self.finish_game(success=False)
+            return
+
+        if next_cell == FINISH:
+            self.finish_game(success=True)
+            return
+
+        self.after_id = self.root.after(self.delay_ms, self.animate_one_step)
+
+    def finish_game(self, success: bool) -> None:
+        self.running = False
+        self.finished = True
+        self.after_id = None
+
+        minutes = self.elapsed_seconds / 60.0
+
+        if success and self.elapsed_seconds <= DEATH_TIME_SEC:
+            self.status_var.set("SUCCESS")
+            self.result_var.set(
+                f"SUCCESS at minute {minutes:.3f}\n"
+                f"Moves used: {self.step_index}"
+            )
+            print(
+                f"SUCCESS: mouse reached the cheese at minute {minutes:.3f} "
+                f"({self.elapsed_seconds:.2f} seconds), moves={self.step_index}"
+            )
+        else:
+            self.status_var.set("DEAD")
+            self.result_var.set(
+                f"DEAD at minute {minutes:.3f}\n"
+                "Time exceeded 3.00 minutes."
+            )
+            print(
+                f"DEAD: mouse exceeded 3 minutes at minute {minutes:.3f}, "
+                f"moves={self.step_index}"
+            )
+
+    def draw_maze(self) -> None:
+        if self.candidate is None:
+            return
+
+        self.canvas.delete("all")
+        self.trail_items.clear()
+        self.mouse_item = None
+        self.mouse_nose_item = None
+
+        walls = self.candidate.walls
+        p = CELL_PIXELS
+
+        # Start background.
+        self.canvas.create_rectangle(
+            1,
+            1,
+            p - 1,
+            p - 1,
+            fill="#b8f2b0",
+            outline="",
+        )
+
+        # Finish background.
+        finish_x = FINISH[1] * p
+        finish_y = FINISH[0] * p
+        self.canvas.create_rectangle(
+            finish_x + 1,
+            finish_y + 1,
+            finish_x + p - 1,
+            finish_y + p - 1,
+            fill="#fff1a8",
+            outline="",
+        )
+
+        # Draw cheese as a triangle.
+        self.canvas.create_polygon(
+            finish_x + 4,
+            finish_y + p - 4,
+            finish_x + p - 4,
+            finish_y + p - 4,
+            finish_x + p - 5,
+            finish_y + 5,
+            fill="#f4c430",
+            outline="#9f7a00",
+            width=1,
+        )
+        self.canvas.create_oval(
+            finish_x + p * 0.57,
+            finish_y + p * 0.57,
+            finish_x + p * 0.72,
+            finish_y + p * 0.72,
+            fill="#d49a00",
+            outline="",
+        )
+
+        self.canvas.create_text(
+            3,
+            p / 2,
+            text="S",
+            anchor="w",
+            font=("Arial", 8, "bold"),
+        )
+
+        # Maze walls.
+        for row in range(ROWS):
+            for col in range(COLS):
+                x1 = col * p
+                y1 = row * p
+                x2 = x1 + p
+                y2 = y1 + p
+                cell_walls = walls[row][col]
+
+                if cell_walls & NORTH:
+                    self.canvas.create_line(x1, y1, x2, y1, width=2)
+                if cell_walls & WEST:
+                    self.canvas.create_line(x1, y1, x1, y2, width=2)
+                if row == ROWS - 1 and cell_walls & SOUTH:
+                    self.canvas.create_line(x1, y2, x2, y2, width=2)
+                if col == COLS - 1 and cell_walls & EAST:
+                    self.canvas.create_line(x2, y1, x2, y2, width=2)
+
+        # Draw visible entrance and exit arrows outside the field.
+        self.canvas.create_line(0, p / 2, 8, p / 2, arrow=tk.LAST, width=2)
+        self.canvas.create_line(
+            COLS * p - 8,
+            ROWS * p - p / 2,
+            COLS * p,
+            ROWS * p - p / 2,
+            arrow=tk.LAST,
+            width=2,
+        )
+
+    def draw_trail(self, cell: Cell) -> None:
+        row, col = cell
+        p = CELL_PIXELS
+        cx = col * p + p / 2
+        cy = row * p + p / 2
+        trail = self.canvas.create_oval(
+            cx - 1.5,
+            cy - 1.5,
+            cx + 1.5,
+            cy + 1.5,
+            fill="#8bb8e8",
+            outline="",
+        )
+        self.trail_items.append(trail)
+
+    def place_mouse(self, cell: Cell, facing: int) -> None:
+        row, col = cell
+        p = CELL_PIXELS
+        cx = col * p + p / 2
+        cy = row * p + p / 2
+        radius = p * 0.31
+
+        if self.mouse_item is None:
+            self.mouse_item = self.canvas.create_oval(
+                cx - radius,
+                cy - radius,
+                cx + radius,
+                cy + radius,
+                fill="#888888",
+                outline="#222222",
+                width=1,
+            )
+        else:
+            self.canvas.coords(
+                self.mouse_item,
+                cx - radius,
+                cy - radius,
+                cx + radius,
+                cy + radius,
+            )
+            self.canvas.tag_raise(self.mouse_item)
+
+        nose_length = p * 0.38
+        nose_x = cx + DC[facing] * nose_length
+        nose_y = cy + DR[facing] * nose_length
+
+        if self.mouse_nose_item is None:
+            self.mouse_nose_item = self.canvas.create_line(
+                cx,
+                cy,
+                nose_x,
+                nose_y,
+                arrow=tk.LAST,
+                width=2,
+                fill="#222222",
+            )
+        else:
+            self.canvas.coords(self.mouse_nose_item, cx, cy, nose_x, nose_y)
+            self.canvas.tag_raise(self.mouse_nose_item)
+
+
+def run_headless(seed_offset: int = 0) -> None:
+    selected, compute_cycles, total_seconds = build_game(seed_offset)
+    success_minutes = selected.simulated_seconds / 60.0
+
+    print(
+        f"HEADLESS RESULT: SUCCESS at minute {success_minutes:.3f}; "
+        f"moves={selected.moves}; compute cycles={compute_cycles}; "
+        f"total compute={total_seconds * 1000:.3f} ms"
+    )
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="30x30 AI mouse-to-cheese maze game."
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run computation and print the result without opening the GUI.",
+    )
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help="Animate each move using the actual MOVE_TIME_SEC delay.",
+    )
+    parser.add_argument(
+        "--seed-offset",
+        type=int,
+        default=0,
+        help="Add an integer offset to the fixed base seed.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_arguments()
+
+    if args.headless:
+        run_headless(args.seed_offset)
+        return
+
+    root = tk.Tk()
+    game = MazeGame(root, realtime=args.realtime)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
